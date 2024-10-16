@@ -1,0 +1,202 @@
+#!/bin/bash
+
+# Variables
+vnetName="AZ900-VNET"
+resourceGroup="AZ900-RG"
+location="East Asia"
+subnetName="MySubnet"
+availabilitySetName="MyAvailabilitySet"
+vmSize="Standard_DS1_v2"
+username="azureuser"
+sshKeyFile="$HOME/.ssh/id_rsa.pub"  # SSH public key path
+image="Win2016Datacenter"  # Windows Server 2016 image
+nsgName="MyNetworkSecurityGroup"
+loadBalancerName="MyLoadBalancer"
+backendPoolName="MyBackendPool"
+publicIpNamePrefix="PublicIP-ismt-vm"
+vnetAddressPrefix="10.0.0.0/16"
+subnetPrefix="10.0.1.0/24"
+vmssName="MyScaleSet"
+
+# Function to clean up resources in case of errors
+cleanup() {
+    echo "Cleaning up resources..."
+    az group delete --name "$resourceGroup" --yes --no-wait
+}
+
+# Check if resource group exists, create if not
+echo "Checking for resource group: $resourceGroup..."
+az group show --name "$resourceGroup" &> /dev/null
+if [ $? -ne 0 ]; then
+    echo "Creating resource group: $resourceGroup..."
+    az group create --name "$resourceGroup" --location "$location"
+fi
+
+# Create Virtual Network and Subnet
+echo "Creating Virtual Network: $vnetName..."
+az network vnet create \
+  --name "$vnetName" \
+  --resource-group "$resourceGroup" \
+  --location "$location" \
+  --address-prefix "$vnetAddressPrefix" \
+  --subnet-name "$subnetName" \
+  --subnet-prefix "$subnetPrefix"
+
+# Create Network Security Group and allow port 80 for HTTP
+echo "Creating Network Security Group: $nsgName..."
+az network nsg create --resource-group "$resourceGroup" --name "$nsgName"
+az network nsg rule create \
+  --resource-group "$resourceGroup" \
+  --nsg-name "$nsgName" \
+  --name Allow-HTTP \
+  --protocol tcp \
+  --priority 1001 \
+  --destination-port-range 80 \
+  --access allow
+
+# Create Availability Set
+echo "Creating Availability Set: $availabilitySetName..."
+az vm availability-set create \
+  --name "$availabilitySetName" \
+  --resource-group "$resourceGroup" \
+  --location "$location"
+
+# Create Load Balancer and Frontend IP Configuration
+echo "Creating Load Balancer: $loadBalancerName..."
+az network lb create \
+  --resource-group "$resourceGroup" \
+  --name "$loadBalancerName" \
+  --sku Standard \
+  --location "$location" \
+  --frontend-ip-name "MyFrontEnd" \
+  --backend-pool-name "$backendPoolName"
+
+# Create Health Probe for Load Balancer
+echo "Creating Health Probe for Load Balancer..."
+az network lb probe create \
+  --resource-group "$resourceGroup" \
+  --lb-name "$loadBalancerName" \
+  --name MyHealthProbe \
+  --protocol Http \
+  --port 80 \
+  --request-path / \
+  --interval 15 \
+  --threshold 2
+
+# Create Public IPs and VMs, Configure IIS, Add VMs to Backend Pool
+for i in {1..2}; do
+  publicIpName="${publicIpNamePrefix}-0$i"
+  
+  # Create Public IP for each VM
+  echo "Creating Public IP: $publicIpName..."
+  az network public-ip create --resource-group "$resourceGroup" --name "$publicIpName" --sku Standard
+  
+  # Create VM
+  echo "Creating VM: ismt-vm-0$i..."
+  az vm create \
+    --name "ismt-vm-0$i" \
+    --resource-group "$resourceGroup" \
+    --location "$location" \
+    --size "$vmSize" \
+    --image "$image" \
+    --admin-username "$username" \
+    --admin-password "P@ssw0rd1234!" \
+    --vnet-name "$vnetName" \
+    --subnet "$subnetName" \
+    --public-ip-address "$publicIpName" \
+    --availability-set "$availabilitySetName" \
+    --nsg "$nsgName"
+
+  # Check if VM creation was successful
+  if [ $? -ne 0 ]; then
+      echo "Failed to create VM: ismt-vm-0$i. Cleaning up and exiting."
+      cleanup
+      exit 1
+  fi
+
+  # Add VM to Load Balancer Backend Pool
+  echo "Adding VM: ismt-vm-0$i to Load Balancer Backend Pool..."
+  az network lb address-pool address add \
+    --resource-group "$resourceGroup" \
+    --lb-name "$loadBalancerName" \
+    --pool-name "$backendPoolName" \
+    --ip-address "10.0.1.$((10 + i))" \
+    --subnet "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$resourceGroup/providers/Microsoft.Network/virtualNetworks/$vnetName/subnets/$subnetName"
+
+  # Install IIS and create custom index.html for each VM
+  echo "Installing IIS on VM: ismt-vm-0$i..."
+  az vm extension set \
+    --resource-group "$resourceGroup" \
+    --vm-name "ismt-vm-0$i" \
+    --name customScript \
+    --publisher Microsoft.Compute \
+    --settings "{\"commandToExecute\": \"powershell Install-WindowsFeature -name Web-Server; Add-Content -Path 'C:\\inetpub\\wwwroot\\index.html' -Value '<html><body><h1>Welcome to VM ismt-vm-0$i</h1><p>This is the VM ismt-vm-0$i serving content!</p></body></html>'\"}"
+
+  # Open Port 80 on the VM
+  echo "Opening port 80 on VM: ismt-vm-0$i..."
+  az vm open-port --resource-group "$resourceGroup" --name "ismt-vm-0$i" --port 80
+done
+
+# Create Load Balancer Rule to distribute traffic on port 80
+echo "Creating Load Balancer rule for HTTP traffic..."
+az network lb rule create \
+  --resource-group "$resourceGroup" \
+  --lb-name "$loadBalancerName" \
+  --name "HTTPRule" \
+  --protocol Tcp \
+  --frontend-port 80 \
+  --backend-port 80 \
+  --frontend-ip-name "MyFrontEnd" \
+  --backend-pool-name "$backendPoolName" \
+  --probe-name "MyHealthProbe"
+
+# Create Virtual Machine Scale Set (VMSS)
+echo "Creating Virtual Machine Scale Set: $vmssName..."
+az vmss create \
+  --resource-group "$resourceGroup" \
+  --name "$vmssName" \
+  --image "$image" \
+  --admin-username "$username" \
+  --admin-password "P@ssw0rd1234!" \
+  --vnet-name "$vnetName" \
+  --subnet "$subnetName" \
+  --backend-pool-name "$backendPoolName" \
+  --load-balancer "$loadBalancerName" \
+  --nsg "$nsgName" \
+  --instance-count 2 \
+  --upgrade-policy-mode automatic \
+  --custom-data cloud-init.txt
+
+# Define autoscale rules for VM Scale Set
+echo "Configuring autoscale rules for the VM Scale Set..."
+
+# Scale out: Increase instances by 1 if average CPU > 10% for 3 seconds
+az monitor autoscale create \
+  --resource-group "$resourceGroup" \
+  --name "AutoScaleRule" \
+  --target "$vmssName" \
+  --min-count 1 \
+  --max-count 10 \
+  --count 2
+
+az monitor autoscale rule create \
+  --resource-group "$resourceGroup" \
+  --autoscale-name "AutoScaleRule" \
+  --condition "Percentage CPU > 10 avg 00:00:03" \
+  --scale out 1 \
+  --cooldown 1
+
+# Scale in: Decrease instances by 1 if average CPU < 10%
+az monitor autoscale rule create \
+  --resource-group "$resourceGroup" \
+  --autoscale-name "AutoScaleRule" \
+  --condition "Percentage CPU < 10 avg 00:00:03" \
+  --scale in 1 \
+  --cooldown 1
+
+# Verify Load Balancer health probe and rules
+echo "Checking Load Balancer rules and probe..."
+az network lb rule list --resource-group "$resourceGroup" --lb-name "$loadBalancerName" -o table
+az network lb probe list --resource-group "$resourceGroup" --lb-name "$loadBalancerName" -o table
+
+echo "All tasks completed successfully!"
