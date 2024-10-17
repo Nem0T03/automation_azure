@@ -1,202 +1,133 @@
 #!/bin/bash
 
 # Variables
-vnetName="AZ900-VNET"
 resourceGroup="AZ900-RG"
-location="East Asia"
-subnetName="MySubnet"
-availabilitySetName="MyAvailabilitySet"
+location="EastAsia"
+vmssName="MyVMSS"
+storageAccountName="mystorageaccount$RANDOM"
+containerName="myscripts"
+adminUsername="azureuser"
 vmSize="Standard_DS1_v2"
-username="azureuser"
-sshKeyFile="$HOME/.ssh/id_rsa.pub"  # SSH public key path
-image="Win2016Datacenter"  # Windows Server 2016 image
-nsgName="MyNetworkSecurityGroup"
-loadBalancerName="MyLoadBalancer"
-backendPoolName="MyBackendPool"
-publicIpNamePrefix="PublicIP-ismt-vm"
-vnetAddressPrefix="10.0.0.0/16"
-subnetPrefix="10.0.1.0/24"
-vmssName="MyScaleSet"
+image="Win2019Datacenter"
+scriptFileName="install_iis.ps1"
+scaleSetCapacity=1  # Reduce initial instance count to stay within quota limits
+adminPassword="YourPassword@123"  # Replace with your secure password
+expiryDate="2024-12-31T23:59:00Z"  # Adjust expiry date for SAS token as needed
+nsgName="MyNSG"
+vnetName="MyVNet"
+subnetName="MySubnet"
 
-# Function to clean up resources in case of errors
-cleanup() {
-    echo "Cleaning up resources..."
-    az group delete --name "$resourceGroup" --yes --no-wait
-}
+# Step 1: Create the resource group
+echo "Creating Resource Group: $resourceGroup..."
+az group create --name "$resourceGroup" --location "$location"
 
-# Check if resource group exists, create if not
-echo "Checking for resource group: $resourceGroup..."
-az group show --name "$resourceGroup" &> /dev/null
-if [ $? -ne 0 ]; then
-    echo "Creating resource group: $resourceGroup..."
-    az group create --name "$resourceGroup" --location "$location"
-fi
-
-# Create Virtual Network and Subnet
+# Step 2: Create a virtual network and subnet
 echo "Creating Virtual Network: $vnetName..."
-az network vnet create \
-  --name "$vnetName" \
-  --resource-group "$resourceGroup" \
-  --location "$location" \
-  --address-prefix "$vnetAddressPrefix" \
-  --subnet-name "$subnetName" \
-  --subnet-prefix "$subnetPrefix"
+az network vnet create --resource-group "$resourceGroup" --name "$vnetName" --subnet-name "$subnetName" --location "$location"
 
-# Create Network Security Group and allow port 80 for HTTP
+# Step 3: Create a Network Security Group (NSG)
 echo "Creating Network Security Group: $nsgName..."
-az network nsg create --resource-group "$resourceGroup" --name "$nsgName"
+az network nsg create --resource-group "$resourceGroup" --name "$nsgName" --location "$location"
+
+# Step 4: Create an inbound security rule to allow port 80 (HTTP) in NSG
+echo "Creating inbound security rule for port 80 (HTTP)..."
 az network nsg rule create \
   --resource-group "$resourceGroup" \
   --nsg-name "$nsgName" \
-  --name Allow-HTTP \
-  --protocol tcp \
+  --name "AllowHTTP" \
   --priority 1001 \
-  --destination-port-range 80 \
-  --access allow
-
-# Create Availability Set
-echo "Creating Availability Set: $availabilitySetName..."
-az vm availability-set create \
-  --name "$availabilitySetName" \
-  --resource-group "$resourceGroup" \
-  --location "$location"
-
-# Create Load Balancer and Frontend IP Configuration
-echo "Creating Load Balancer: $loadBalancerName..."
-az network lb create \
-  --resource-group "$resourceGroup" \
-  --name "$loadBalancerName" \
-  --sku Standard \
-  --location "$location" \
-  --frontend-ip-name "MyFrontEnd" \
-  --backend-pool-name "$backendPoolName"
-
-# Create Health Probe for Load Balancer
-echo "Creating Health Probe for Load Balancer..."
-az network lb probe create \
-  --resource-group "$resourceGroup" \
-  --lb-name "$loadBalancerName" \
-  --name MyHealthProbe \
-  --protocol Http \
-  --port 80 \
-  --request-path / \
-  --interval 15 \
-  --threshold 2
-
-# Create Public IPs and VMs, Configure IIS, Add VMs to Backend Pool
-for i in {1..2}; do
-  publicIpName="${publicIpNamePrefix}-0$i"
-  
-  # Create Public IP for each VM
-  echo "Creating Public IP: $publicIpName..."
-  az network public-ip create --resource-group "$resourceGroup" --name "$publicIpName" --sku Standard
-  
-  # Create VM
-  echo "Creating VM: ismt-vm-0$i..."
-  az vm create \
-    --name "ismt-vm-0$i" \
-    --resource-group "$resourceGroup" \
-    --location "$location" \
-    --size "$vmSize" \
-    --image "$image" \
-    --admin-username "$username" \
-    --admin-password "P@ssw0rd1234!" \
-    --vnet-name "$vnetName" \
-    --subnet "$subnetName" \
-    --public-ip-address "$publicIpName" \
-    --availability-set "$availabilitySetName" \
-    --nsg "$nsgName"
-
-  # Check if VM creation was successful
-  if [ $? -ne 0 ]; then
-      echo "Failed to create VM: ismt-vm-0$i. Cleaning up and exiting."
-      cleanup
-      exit 1
-  fi
-
-  # Add VM to Load Balancer Backend Pool
-  echo "Adding VM: ismt-vm-0$i to Load Balancer Backend Pool..."
-  az network lb address-pool address add \
-    --resource-group "$resourceGroup" \
-    --lb-name "$loadBalancerName" \
-    --pool-name "$backendPoolName" \
-    --ip-address "10.0.1.$((10 + i))" \
-    --subnet "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$resourceGroup/providers/Microsoft.Network/virtualNetworks/$vnetName/subnets/$subnetName"
-
-  # Install IIS and create custom index.html for each VM
-  echo "Installing IIS on VM: ismt-vm-0$i..."
-  az vm extension set \
-    --resource-group "$resourceGroup" \
-    --vm-name "ismt-vm-0$i" \
-    --name customScript \
-    --publisher Microsoft.Compute \
-    --settings "{\"commandToExecute\": \"powershell Install-WindowsFeature -name Web-Server; Add-Content -Path 'C:\\inetpub\\wwwroot\\index.html' -Value '<html><body><h1>Welcome to VM ismt-vm-0$i</h1><p>This is the VM ismt-vm-0$i serving content!</p></body></html>'\"}"
-
-  # Open Port 80 on the VM
-  echo "Opening port 80 on VM: ismt-vm-0$i..."
-  az vm open-port --resource-group "$resourceGroup" --name "ismt-vm-0$i" --port 80
-done
-
-# Create Load Balancer Rule to distribute traffic on port 80
-echo "Creating Load Balancer rule for HTTP traffic..."
-az network lb rule create \
-  --resource-group "$resourceGroup" \
-  --lb-name "$loadBalancerName" \
-  --name "HTTPRule" \
   --protocol Tcp \
-  --frontend-port 80 \
-  --backend-port 80 \
-  --frontend-ip-name "MyFrontEnd" \
-  --backend-pool-name "$backendPoolName" \
-  --probe-name "MyHealthProbe"
+  --destination-port-ranges 80 \
+  --access Allow \
+  --direction Inbound
 
-# Create Virtual Machine Scale Set (VMSS)
-echo "Creating Virtual Machine Scale Set: $vmssName..."
+# Step 5: Associate the NSG with the subnet
+echo "Associating NSG with the subnet..."
+az network vnet subnet update --vnet-name "$vnetName" --name "$subnetName" --resource-group "$resourceGroup" --network-security-group "$nsgName"
+
+# Step 6: Create a storage account
+echo "Creating Storage Account: $storageAccountName..."
+az storage account create --name "$storageAccountName" --resource-group "$resourceGroup" --location "$location" --sku Standard_LRS
+
+# Step 7: Retrieve the storage account key
+echo "Retrieving Storage Account Key..."
+accountKey=$(az storage account keys list --resource-group "$resourceGroup" --account-name "$storageAccountName" --query '[0].value' -o tsv)
+
+# Step 8: Create a container in the storage account
+echo "Creating container: $containerName..."
+az storage container create --name "$containerName" --account-name "$storageAccountName" --account-key "$accountKey"
+
+# Step 9: Upload the script to the container
+echo "Uploading script to the storage container..."
+echo 'Install-WindowsFeature -name Web-Server -IncludeManagementTools' > "$scriptFileName"
+az storage blob upload --account-name "$storageAccountName" --account-key "$accountKey" --container-name "$containerName" --file "$scriptFileName" --name "$scriptFileName"
+
+# Step 10: Generate a SAS token for the script
+echo "Generating SAS token for the script..."
+sasToken=$(az storage blob generate-sas --account-name "$storageAccountName" --container-name "$containerName" --name "$scriptFileName" --permissions r --expiry "$expiryDate" --account-key "$accountKey" --https-only --output tsv)
+
+# Construct the full URL to the script with the SAS token
+fileUri="https://$storageAccountName.blob.core.windows.net/$containerName/$scriptFileName?$sasToken"
+
+# Step 11: Create the VM Scale Set with the subnet and NSG
+echo "Creating VM Scale Set: $vmssName..."
 az vmss create \
   --resource-group "$resourceGroup" \
   --name "$vmssName" \
   --image "$image" \
-  --admin-username "$username" \
-  --admin-password "P@ssw0rd1234!" \
-  --vnet-name "$vnetName" \
+  --admin-username "$adminUsername" \
+  --instance-count "$scaleSetCapacity" \
+  --vm-sku "$vmSize" \
   --subnet "$subnetName" \
-  --backend-pool-name "$backendPoolName" \
-  --load-balancer "$loadBalancerName" \
-  --nsg "$nsgName" \
-  --instance-count 2 \
+  --vnet-name "$vnetName" \
   --upgrade-policy-mode automatic \
-  --custom-data cloud-init.txt
+  --storage-sku Standard_LRS \
+  --authentication-type password \
+  --admin-password "$adminPassword"
 
-# Define autoscale rules for VM Scale Set
-echo "Configuring autoscale rules for the VM Scale Set..."
+# Step 12: Add Custom Script Extension to install IIS from the script
+echo "Adding Custom Script Extension to VM Scale Set..."
+az vmss extension set \
+  --publisher Microsoft.Compute \
+  --version 1.10 \
+  --name CustomScriptExtension \
+  --resource-group "$resourceGroup" \
+  --vmss-name "$vmssName" \
+  --settings "{'fileUris': ['$fileUri'], 'commandToExecute': 'powershell -ExecutionPolicy Unrestricted -File $scriptFileName'}"
 
-# Scale out: Increase instances by 1 if average CPU > 10% for 3 seconds
+# Step 13: Apply the scaling rule based on CPU usage
+echo "Setting up autoscale for VM Scale Set: $vmssName..."
+
+# Get the resource ID of the VM Scale Set
+vmssResourceId=$(az vmss show --resource-group "$resourceGroup" --name "$vmssName" --query "id" -o tsv)
+
+# Create the autoscale settings
 az monitor autoscale create \
   --resource-group "$resourceGroup" \
-  --name "AutoScaleRule" \
-  --target "$vmssName" \
+  --name "VMSSAutoScale" \
+  --resource "$vmssResourceId" \
   --min-count 1 \
-  --max-count 10 \
-  --count 2
+  --max-count 4 \
+  --count 1
 
+# Step 14: Add a scaling rule to increase VM count when CPU usage > 1% for 1 minute
+echo "Adding autoscale rule for increasing VM count on high CPU..."
 az monitor autoscale rule create \
   --resource-group "$resourceGroup" \
-  --autoscale-name "AutoScaleRule" \
-  --condition "Percentage CPU > 10 avg 00:00:03" \
+  --autoscale-name "VMSSAutoScale" \
   --scale out 1 \
-  --cooldown 1
+  --condition "Percentage CPU > 1 avg 1m" \
+  --cooldown 1 \
+  --resource "$vmssResourceId"
 
-# Scale in: Decrease instances by 1 if average CPU < 10%
+# Step 15: Add a scaling rule to decrease VM count when CPU usage < 1% for 1 minute
+echo "Adding autoscale rule for decreasing VM count on lower CPU..."
 az monitor autoscale rule create \
   --resource-group "$resourceGroup" \
-  --autoscale-name "AutoScaleRule" \
-  --condition "Percentage CPU < 10 avg 00:00:03" \
+  --autoscale-name "VMSSAutoScale" \
   --scale in 1 \
-  --cooldown 1
+  --condition "Percentage CPU < 1 avg 1m" \
+  --cooldown 1 \
+  --resource "$vmssResourceId"
 
-# Verify Load Balancer health probe and rules
-echo "Checking Load Balancer rules and probe..."
-az network lb rule list --resource-group "$resourceGroup" --lb-name "$loadBalancerName" -o table
-az network lb probe list --resource-group "$resourceGroup" --lb-name "$loadBalancerName" -o table
-
-echo "All tasks completed successfully!"
+echo "Deployment complete!"
