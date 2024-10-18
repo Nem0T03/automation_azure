@@ -34,7 +34,7 @@ az network vnet create --resource-group "$resourceGroup" --name "$vnetName" --su
 echo "Creating Network Security Group: $nsgName..."
 az network nsg create --resource-group "$resourceGroup" --name "$nsgName" --location "$location"
 
-# Step 4: Create inbound security rules to allow HTTP (port 80) in NSG
+# Step 4: Create inbound security rules to allow HTTP (port 80) and RDP (port 3389) in NSG
 echo "Creating inbound security rule for port 80 (HTTP)..."
 az network nsg rule create \
   --resource-group "$resourceGroup" \
@@ -43,6 +43,17 @@ az network nsg rule create \
   --priority 1001 \
   --protocol Tcp \
   --destination-port-ranges 80 \
+  --access Allow \
+  --direction Inbound
+
+echo "Creating inbound security rule for port 3389 (RDP)..."
+az network nsg rule create \
+  --resource-group "$resourceGroup" \
+  --nsg-name "$nsgName" \
+  --name "AllowRDP" \
+  --priority 1000 \
+  --protocol Tcp \
+  --destination-port-ranges 3389 \
   --access Allow \
   --direction Inbound
 
@@ -109,64 +120,63 @@ az vm create \
   --vnet-name "$vnetName" \
   --subnet "$subnetName"
 
-# Step 13: Retrieve the public IP of the main VM
-echo "Retrieving the public IP of the main VM..."
-publicIP=$(az vm show --resource-group "$resourceGroup" --name "$mainVMName" --query "publicIpAddress" -o tsv)
+# Step 13: Install Docker and run IIS container on the main VM using a custom script extension
+echo "Installing Docker and running IIS container on the main VM..."
+az vm extension set \
+  --resource-group "$resourceGroup" \
+  --vm-name "$mainVMName" \
+  --name CustomScriptExtension \
+  --publisher Microsoft.Compute \
+  --settings "{\"commandToExecute\":\"powershell -ExecutionPolicy Unrestricted -Command \
+    Install-WindowsFeature -Name containers -IncludeManagementTools; \
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+    Install-Module -Name DockerMsftProvider -Repository PSGallery -Force; \
+    Install-Package -Name docker -ProviderName DockerMsftProvider -Force; \
+    Start-Service docker; \
+    docker pull mcr.microsoft.com/windows/servercore/iis; \
+    docker run -d -p 80:80 --name iis-container mcr.microsoft.com/windows/servercore/iis\"}"
 
-# Step 14: Replace placeholder in index.html with the public IP
+# Step 14: Retrieve the public IP address of the main VM
+echo "Retrieving the public IP address of the main VM..."
+publicIP=$(az vm list-ip-addresses --resource-group "$resourceGroup" --name "$mainVMName" --query "[].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)
+
+# Check if the public IP address was retrieved
+if [ -z "$publicIP" ]; then
+    echo "Error: Could not retrieve the public IP address of the VM"
+    exit 1
+else
+    echo "Public IP Address of the main VM: $publicIP"
+fi
+
+# Step 15: Replace placeholder in index.html with the public IP
 echo "Updating index.html with public IP..."
 sed -i "s/%PUBLIC_IP%/$publicIP/g" "$indexHtmlFileName"
 
-# Step 15: Upload the updated index.html file to the main VM container
+# Step 16: Upload the updated index.html file to the main VM container
 echo "Uploading updated index.html to the main container..."
 az storage blob upload --account-name "$storageAccountName" --account-key "$accountKey" --container-name "$containerNameMain" --file "$indexHtmlFileName" --name "$indexHtmlFileName"
 
-# Step 16: Create the VM Scale Set
+# Step 17: Create the VM Scale Set
 echo "Creating VM Scale Set: $vmssName..."
 az vmss create \
   --resource-group "$resourceGroup" \
   --name "$vmssName" \
   --image "$image" \
   --admin-username "$adminUsername" \
+  --admin-password "$adminPassword" \
   --instance-count $scaleSetCapacity \
   --vm-sku "$vmSize" \
   --subnet "$subnetName" \
   --vnet-name "$vnetName" \
   --upgrade-policy-mode automatic \
-  --storage-sku Standard_LRS \
-  --authentication-type password \
-  --admin-password "$adminPassword"
+  --custom-data "$scriptFileUriScaleSet" \
+  --lb-sku Standard
 
-# Step 17: Add Custom Script Extension to install IIS from the script
-echo "Adding Custom Script Extension to VM Scale Set..."
-az vmss extension set \
-  --publisher Microsoft.Compute \
-  --version 1.10 \
-  --name CustomScriptExtension \
-  --resource-group "$resourceGroup" \
-  --vmss-name "$vmssName" \
-  --settings "{'fileUris': ['$scriptFileUriScaleSet'], 'commandToExecute': 'powershell -ExecutionPolicy Unrestricted -File $scriptFileName'}"
+# Step 18: Configure autoscale based on CPU usage
+echo "Configuring autoscale for the VM Scale Set..."
+az monitor autoscale create --resource-group "$resourceGroup" --resource "$vmssName" --resource-type "Microsoft.Compute/virtualMachineScaleSets" --name "$vmssName-ScaleSet" --min-count $minInstanceCount --max-count $maxInstanceCount --count $scaleSetCapacity
 
-# Step 18: Configure Autoscaling for the VM Scale Set
-echo "Configuring autoscale for VM Scale Set..."
-az monitor autoscale create \
-  --resource-group "$resourceGroup" \
-  --name "$vmssName-autoscale" \
-  --target "$vmssName" \
-  --min-count $minInstanceCount \
-  --max-count $maxInstanceCount \
-  --count $scaleSetCapacity
+az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName-ScaleSet" --scale out 1 --condition "Percentage CPU > 1 avg 1m"
+az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName-ScaleSet" --scale in 1 --condition "Percentage CPU < 1 avg 1m"
 
-# Step 19: Define autoscale rule to scale out based on CPU usage
-echo "Adding scale-out rule based on CPU usage..."
-az monitor autoscale rule create \
-  --resource-group "$resourceGroup" \
-  --autoscale-name "$vmssName-autoscale" \
-  --condition "Percentage CPU > 1 avg 1m" \
-  --scale out 1 \
-  --cooldown 1
-
-# Step 20: Output the public IP of the main VM
-echo "Deployment complete!"
-echo "Main VM Public IP: $publicIP"
-echo "You can access your web server at http://$publicIP/index.html"
+echo "Azure automation script completed successfully!"
