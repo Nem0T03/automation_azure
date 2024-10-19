@@ -40,8 +40,8 @@ createNSG() {
     az network nsg create --resource-group "$resourceGroup" --name "$nsgName" --location "$location"
 
     # Create inbound security rules
-    echo "Creating inbound security rule for port 80 (HTTP)..."
-    az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowHTTP" --priority 1001 --protocol Tcp --destination-port-ranges 80 --access Allow --direction Inbound
+    echo "Creating inbound security rule for port 80 (HTTP) allowing any source..."
+    az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowHTTP" --priority 1001 --protocol Tcp --destination-port-ranges 80 --access Allow --direction Inbound --source-address-prefixes "*"
 
     echo "Creating inbound security rule for port 3389 (RDP)..."
     az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowRDP" --priority 1000 --protocol Tcp --destination-port-ranges 3389 --access Allow --direction Inbound
@@ -64,20 +64,19 @@ createStorageAccount() {
     az storage container create --name "$containerNameScaleSet" --account-name "$storageAccountName" --account-key "$accountKey"
 }
 
-# Function to create index.html file
+# Function to create an empty index.html file
 createIndexHtml() {
-    echo "Creating index.html file template..."
+    echo "Creating an empty index.html file..."
     cat <<EOF > "$indexHtmlFileName"
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to My Web Server</title>
+    <title>Welcome</title>
 </head>
 <body>
-    <h1>Hello, World!</h1>
-    <p>This is a simple web page hosted on my Windows Server.</p>
+    <h1>Hello, Azure!</h1>
     <p>Main VM Public IP: <strong>%PUBLIC_IP%</strong></p>
 </body>
 </html>
@@ -180,19 +179,10 @@ configureAutoscale() {
     az monitor autoscale create --resource-group "$resourceGroup" --resource "$vmssName" --resource-type "Microsoft.Compute/virtualMachineScaleSets" --name "$vmssName" \
     --min-count $minInstanceCount --max-count $maxInstanceCount --count $scaleSetCapacity
     az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName" --condition "Percentage CPU > 1 avg 1m" --scale out 1
-    az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName" --condition "Percentage CPU < 1 avg 1m" --scale in 1
+    az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName" --condition "Percentage CPU < 1 avg 5m" --scale in 1
 }
 
-# Function to delete resources on error
-deleteResourcesOnFailure() {
-    if [ $? -ne 0 ]; then
-        echo "Error encountered, deleting all resources..."
-        az group delete --name "$resourceGroup" --yes --no-wait
-        exit 1
-    fi
-}
-
-# Execute all functions in order
+# Main script execution
 createResourceGroup
 createVNetAndSubnet
 createNSG
@@ -200,13 +190,11 @@ createStorageAccount
 createIndexHtml
 uploadScriptsAndGenerateSASTokens
 createMainVM
-deleteResourcesOnFailure
 configureMainVM
 retrievePublicIP
 updateIndexHtml
 uploadUpdatedIndexHtml
 createVMSS
 configureAutoscale
-deleteResourcesOnFailure
 
-echo "Automation script completed successfully."
+echo "Azure automation script completed successfully."
