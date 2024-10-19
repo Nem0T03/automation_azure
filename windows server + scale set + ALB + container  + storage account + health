@@ -13,14 +13,17 @@ vmSize="Standard_DS1_v2"
 image="Win2019Datacenter"
 scriptFileName="install_iis.ps1"
 indexHtmlFileName="index.html"
-adminPassword="YourPassword@123"  
-expiryDate="2024-12-31T23:59:00Z"  
+adminPassword="YourPassword@123"
+expiryDate="2024-12-31T23:59:00Z"
 nsgName="MyNSG"
 vnetName="MyVNet"
 subnetName="MySubnet"
+loadBalancerName="MyLoadBalancer"
+backendPoolName="MyBackendPool"
 scaleSetCapacity=1
 minInstanceCount=1
 maxInstanceCount=5
+publicIpNameMain="PublicIP-MainVM"
 
 # Function to create the resource group
 createResourceGroup() {
@@ -34,17 +37,16 @@ createVNetAndSubnet() {
     az network vnet create --resource-group "$resourceGroup" --name "$vnetName" --subnet-name "$subnetName" --location "$location"
 }
 
-# Function to create Network Security Group (NSG)
+# Function to create Network Security Group (NSG) and only allow SSH, RDP, and HTTP
 createNSG() {
     echo "Creating Network Security Group: $nsgName..."
     az network nsg create --resource-group "$resourceGroup" --name "$nsgName" --location "$location"
 
     # Create inbound security rules
-    echo "Creating inbound security rule for port 80 (HTTP) allowing any source..."
-    az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowHTTP" --priority 1001 --protocol Tcp --destination-port-ranges 80 --access Allow --direction Inbound --source-address-prefixes "*"
-
-    echo "Creating inbound security rule for port 3389 (RDP)..."
+    echo "Allowing RDP (3389), SSH (22), and HTTP (80)..."
+    az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowHTTP" --priority 1001 --protocol Tcp --destination-port-ranges 80 --access Allow --direction Inbound
     az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowRDP" --priority 1000 --protocol Tcp --destination-port-ranges 3389 --access Allow --direction Inbound
+    az network nsg rule create --resource-group "$resourceGroup" --nsg-name "$nsgName" --name "AllowSSH" --priority 1002 --protocol Tcp --destination-port-ranges 22 --access Allow --direction Inbound
 
     # Associate the NSG with the subnet
     echo "Associating NSG with the subnet..."
@@ -64,9 +66,9 @@ createStorageAccount() {
     az storage container create --name "$containerNameScaleSet" --account-name "$storageAccountName" --account-key "$accountKey"
 }
 
-# Function to create an empty index.html file
+# Function to create index.html file
 createIndexHtml() {
-    echo "Creating an empty index.html file..."
+    echo "Creating index.html file..."
     cat <<EOF > "$indexHtmlFileName"
 <!DOCTYPE html>
 <html lang="en">
@@ -116,42 +118,39 @@ createMainVM() {
         --subnet "$subnetName"
 }
 
-# Function to install IIS and configure the main VM
-configureMainVM() {
-    echo "Installing IIS and setting up container on the main VM..."
-    az vm extension set \
-        --resource-group "$resourceGroup" \
-        --vm-name "$mainVMName" \
-        --name CustomScriptExtension \
-        --publisher Microsoft.Compute \
-        --settings "{\"commandToExecute\":\"powershell -ExecutionPolicy Unrestricted -Command \
-        Install-WindowsFeature -Name Web-Server -IncludeManagementTools; \
-        Start-Service W3SVC; \
-        Set-Content -Path 'C:\\inetpub\\wwwroot\\index.html' -Value (Get-Content '$PWD/$indexHtmlFileName' -Raw)\"}"
+# Function to create and configure load balancer with health probes
+createLoadBalancer() {
+    echo "Creating Load Balancer: $loadBalancerName..."
+    az network lb create \
+      --resource-group "$resourceGroup" \
+      --name "$loadBalancerName" \
+      --sku Standard \
+      --frontend-ip-name "MyFrontEnd" \
+      --backend-pool-name "$backendPoolName" \
+      --public-ip-address "$publicIpNameMain"
+
+    # Create Health Probe for Load Balancer
+    echo "Creating Health Probe for Load Balancer..."
+    az network lb probe create \
+      --resource-group "$resourceGroup" \
+      --lb-name "$loadBalancerName" \
+      --name MyHealthProbe \
+      --protocol Tcp \
+      --port 80 \
+      --interval 15 \
+      --threshold 2
 }
 
-# Function to retrieve the public IP address of the main VM
-retrievePublicIP() {
-    echo "Retrieving the public IP address of the main VM..."
-    publicIP=$(az vm list-ip-addresses --resource-group "$resourceGroup" --name "$mainVMName" --query "[].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)
-
-    if [ -z "$publicIP" ]; then
-        echo "Error: Could not retrieve the public IP address of the VM"
-        exit 1
-    else
-        echo "Public IP Address of the main VM: $publicIP"
-    fi
-}
-
-# Function to update index.html with public IP
+# Function to update index.html with the Main VM public IP
 updateIndexHtml() {
     echo "Updating index.html with public IP..."
+    publicIP=$(az vm list-ip-addresses --resource-group "$resourceGroup" --name "$mainVMName" --query "[].virtualMachine.network.publicIpAddresses[0].ipAddress" -o tsv)
     sed -i "s/%PUBLIC_IP%/$publicIP/g" "$indexHtmlFileName"
 }
 
-# Function to upload updated index.html
+# Function to upload the updated index.html file
 uploadUpdatedIndexHtml() {
-    echo "Uploading updated index.html to the main container..."
+    echo "Uploading updated index.html..."
     az storage blob upload --account-name "$storageAccountName" --account-key "$accountKey" --container-name "$containerNameMain" --file "$indexHtmlFileName" --name "$indexHtmlFileName"
 }
 
@@ -170,19 +169,11 @@ createVMSS() {
         --vnet-name "$vnetName" \
         --upgrade-policy-mode automatic \
         --custom-data "$scriptFileUriScaleSet" \
-        --lb-sku Standard
+        --lb-sku Standard \
+        --backend-pool-name "$backendPoolName"
 }
 
-# Function to configure autoscale based on CPU usage
-configureAutoscale() {
-    echo "Configuring autoscale for the VM Scale Set..."
-    az monitor autoscale create --resource-group "$resourceGroup" --resource "$vmssName" --resource-type "Microsoft.Compute/virtualMachineScaleSets" --name "$vmssName" \
-    --min-count $minInstanceCount --max-count $maxInstanceCount --count $scaleSetCapacity
-    az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName" --condition "Percentage CPU > 1 avg 1m" --scale out 1
-    az monitor autoscale rule create --resource-group "$resourceGroup" --autoscale-name "$vmssName" --condition "Percentage CPU < 1 avg 5m" --scale in 1
-}
-
-# Main script execution
+# Main Execution
 createResourceGroup
 createVNetAndSubnet
 createNSG
@@ -190,11 +181,9 @@ createStorageAccount
 createIndexHtml
 uploadScriptsAndGenerateSASTokens
 createMainVM
-configureMainVM
-retrievePublicIP
+createLoadBalancer
 updateIndexHtml
 uploadUpdatedIndexHtml
 createVMSS
-configureAutoscale
 
-echo "Azure automation script completed successfully."
+echo "Deployment completed!"
